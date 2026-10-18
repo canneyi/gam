@@ -5351,3 +5351,228 @@ fn wiggle_face_criterion_value_scale_3228() {
         eprintln!("{line}");
     }
 }
+
+/// Temporary #3228 instrument: cold criterion slopes and faces at the ARC rejection floor.
+/// This measures derivatives, but deliberately grades only finiteness, not agreement.
+#[test]
+fn wiggle_face_stall_point_probe_3228() {
+    use gam_solve::estimate::outer_eval_capture::{
+        OuterSeedEvaluation, OuterSeedOrder, OuterSeedProbe, observe_next_outer_seed,
+    };
+    use std::sync::{Arc, Mutex};
+
+    let n = 72usize;
+    let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+        let y = 0.7 * x + 0.5 * x.max(0.0).powi(2) + 0.05 * (7.3 * x).sin();
+        records.push(csv::StringRecord::from(vec![
+            format!("{y:.17e}"),
+            format!("{x:.17e}"),
+        ]));
+    }
+    let data = gam_data::encode_recordswith_inferred_schema(
+        vec!["y".to_string(), "x".to_string()],
+        records,
+    )
+    .expect("encode the face fixture");
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1".to_string()),
+        ..FitConfig::default()
+    };
+    let materialized =
+        materialize("y ~ x", &data, &config).expect("gaussian location-scale materialization");
+    let FitRequest::GaussianLocationScale(request) = materialized.request else {
+        panic!("expected a Gaussian location-scale request");
+    };
+    let GaussianLocationScaleFitRequest {
+        data: req_data,
+        mut spec,
+        options,
+        kappa_options,
+        ..
+    } = request;
+    standardize_gaussian_spec_like_engine(&mut spec);
+    let wiggle_cfg = small_wiggle_cfg();
+    let pilot = fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
+        .expect("face fixture pilot");
+    let basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
+        &pilot,
+        &WiggleBlockConfig {
+            degree: wiggle_cfg.degree,
+            num_internal_knots: wiggle_cfg.num_internal_knots,
+            penalty_order: 2,
+            double_penalty: wiggle_cfg.double_penalty,
+        },
+        &wiggle_cfg.penalty_orders,
+    )
+    .expect("face fixture wiggle basis selection");
+    let wiggle_width = basis.block.design.ncols();
+
+    let report = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&report);
+    observe_next_outer_seed(
+        0,
+        Box::new(
+            move |probe: &mut dyn OuterSeedProbe| -> Result<(), gam_solve::estimate::EstimationError> {
+                let outcome = (|| -> Result<(), gam_solve::estimate::EstimationError> {
+                    let theta = ndarray::array![0.442236348368435, -0.7207590750322803];
+                    let face = |at: &OuterSeedEvaluation| {
+                        assert!(at.cost.is_finite());
+                        let (beta, _) = at.selected_mode.as_ref().expect("probe selected mode");
+                        assert!(beta.iter().all(|value| value.is_finite()));
+                        let start = beta.len() - wiggle_width;
+                        let pinned: Vec<usize> = (0..wiggle_width)
+                            .filter(|&k| beta[start + k].abs() <= 1.0e-10)
+                            .collect();
+                        let free: Vec<usize> = (0..wiggle_width)
+                            .filter(|k| !pinned.contains(k))
+                            .collect();
+                        format!(
+                            "pinned/active={pinned:?} free={free:?} wiggle={:?}",
+                            beta.slice(ndarray::s![start..]).to_vec()
+                        )
+                    };
+                    let base = probe.evaluate(&theta, OuterSeedOrder::ValueAndGradient)?;
+                    let gradient = base.gradient.as_ref().expect("probe analytic gradient");
+                    assert!(gradient.iter().all(|value| value.is_finite()));
+                    let norm = gradient.dot(gradient).sqrt();
+                    assert!(norm.is_finite());
+                    let reported = -1.241715e2;
+                    eprintln!(
+                        "[3228-stall] cold seed={:?} rho={theta:?} V={:.17e} \
+                         reported_V={reported:.7e} cold_minus_reported={:+.9e} \
+                         g={gradient:?} |g|={norm:.12e} {} components={:?}",
+                        probe.layout().seed,
+                        base.cost,
+                        base.cost - reported,
+                        face(&base),
+                        base.criterion_components
+                    );
+                    let again = probe.evaluate(&theta, OuterSeedOrder::Value)?;
+                    let repeat_delta = again.cost - base.cost;
+                    assert!(repeat_delta.is_finite());
+                    eprintln!(
+                        "[3228-stall] cold repeat V={:.17e} dV={repeat_delta:+.12e} {} \
+                         components={:?}",
+                        again.cost,
+                        face(&again),
+                        again.criterion_components
+                    );
+                    for exponent in -10..=-1 {
+                        let t = 10.0_f64.powi(exponent);
+                        let point = &theta - &(gradient * (t / norm));
+                        let at = match probe.evaluate(&point, OuterSeedOrder::Value) {
+                            Ok(at) => at,
+                            Err(error) => {
+                                eprintln!("[3228-stall] scan t={t:.1e} refused: {error}");
+                                continue;
+                            }
+                        };
+                        let measured = at.cost - base.cost;
+                        let predicted = -t * norm;
+                        let ratio = measured / predicted;
+                        assert!([measured, predicted, ratio].iter().all(|value| value.is_finite()));
+                        eprintln!(
+                            "[3228-stall] scan t={t:.1e} V={:.17e} dV={measured:+.12e} \
+                             predicted={predicted:+.12e} ratio={ratio:+.9e} {} components={:?}",
+                            at.cost,
+                            face(&at),
+                            at.criterion_components
+                        );
+                    }
+                    for coordinate in 0..theta.len() {
+                        for exponent in (-7..=-2).rev() {
+                            let h = 10.0_f64.powi(exponent);
+                            let mut points = [theta.clone(), theta.clone()];
+                            points[0][coordinate] += h;
+                            points[1][coordinate] -= h;
+                            // A refused cone evaluation is evidence, not a derivative mismatch.
+                            // Still evaluate and report the other half of that stencil.
+                            let evaluations = [
+                                probe.evaluate(&points[0], OuterSeedOrder::Value),
+                                probe.evaluate(&points[1], OuterSeedOrder::Value),
+                            ];
+                            for (sign, evaluation) in ["+", "-"].into_iter().zip(&evaluations) {
+                                match evaluation {
+                                    Ok(at) => eprintln!(
+                                        "[3228-stall] stencil coordinate={coordinate} h={h:.1e} \
+                                         sign={sign} V={:.17e} dV={:+.12e} {} components={:?}",
+                                        at.cost,
+                                        at.cost - base.cost,
+                                        face(at),
+                                        at.criterion_components
+                                    ),
+                                    Err(error) => eprintln!(
+                                        "[3228-stall] stencil coordinate={coordinate} h={h:.1e} \
+                                         sign={sign} refused: {error}"
+                                    ),
+                                }
+                            }
+                            let [Ok(plus), Ok(minus)] = &evaluations else {
+                                eprintln!(
+                                    "[3228-stall] central coordinate={coordinate} h={h:.1e} \
+                                     analytic={:+.12e} difference=unavailable (refused stencil)",
+                                    gradient[coordinate]
+                                );
+                                continue;
+                            };
+                            let difference = (plus.cost - minus.cost) / (2.0 * h);
+                            let error = difference - gradient[coordinate];
+                            assert!([difference, error].iter().all(|value| value.is_finite()));
+                            eprintln!(
+                                "[3228-stall] central coordinate={coordinate} h={h:.1e} \
+                                 analytic={:+.12e} difference={difference:+.12e} \
+                                 fd_minus_analytic={error:+.12e}",
+                                gradient[coordinate]
+                            );
+                            if let (Some((_, plus_parts)), Some((_, minus_parts))) =
+                                (&plus.criterion_components, &minus.criterion_components)
+                            {
+                                let rates = std::array::from_fn::<_, 4, _>(|k| {
+                                    (plus_parts[k] - minus_parts[k]) / (2.0 * h)
+                                });
+                                assert!(rates.iter().all(|value| value.is_finite()));
+                                eprintln!(
+                                    "[3228-stall] component_fd coordinate={coordinate} h={h:.1e} \
+                                     [fixed_beta,logdet_h,logdet_s,kkt]={rates:?}"
+                                );
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[3228-stall] warm comparison unavailable: OuterSeedProbe::evaluate \
+                         resets to the seed's inner start on EVERY call; a preceding nearby \
+                         evaluation cannot warm-start this API. Cold repeat is only a null control."
+                    );
+                    Ok(())
+                })();
+                *sink.lock().expect("probe report lock") = Some(outcome.map_err(|e| e.to_string()));
+                Ok(())
+            },
+        ),
+    );
+    // The instrument runs before the outer search. Its eventual refusal is not a test failure.
+    let outcome = fit_gaussian_location_scale_terms_with_selected_wiggle(
+        req_data,
+        spec,
+        &pilot,
+        basis,
+        &options,
+        &kappa_options,
+    );
+    eprintln!(
+        "[3228-stall] face refit: {}",
+        match outcome {
+            Ok(_) => "certified".to_string(),
+            Err(error) => format!("refused: {error}"),
+        }
+    );
+    report
+        .lock()
+        .expect("probe report lock")
+        .take()
+        .expect("the outer runner lent no seed probe")
+        .expect("stall-point probe evaluation failed");
+}
