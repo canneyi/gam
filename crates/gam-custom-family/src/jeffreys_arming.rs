@@ -63,25 +63,34 @@ pub fn fit_custom_family_arming_on_evidence_with_rho_prior<
     options: &BlockwiseFitOptions,
     rho_prior: gam_problem::RhoPrior,
 ) -> Result<UnifiedFitResult, CustomFamilyError> {
+    let unarmed = fit_custom_family_with_rho_prior(
+        &family.with_jeffreys_armed(None),
+        specs,
+        options,
+        rho_prior.clone(),
+    );
+    match &unarmed {
+        Ok(fit) => eprintln!("[3228w] {}:{} unarmed fit certified wiggle={:?}", file!(), line!(), fit.block_states.get(2).map(|s| s.beta.to_vec())),
+        Err(e) => eprintln!("[3228w] {}:{} unarmed fit refused: {}", file!(), line!(), e.to_string().chars().take(3000).collect::<String>()),
+    }
     arm_on_evidence(
-        fit_custom_family_with_rho_prior(
-            &family.with_jeffreys_armed(None),
-            specs,
-            options,
-            rho_prior.clone(),
-        ),
+        unarmed,
         |fit| fit,
         CustomFamilyError::jeffreys_arming_evidence,
         |evidence, certified| {
             let warm_specs = certified
                 .map(|fit| warm_started_specs(specs, &fit))
                 .transpose()?;
-            fit_custom_family_with_rho_prior(
+            let armed = fit_custom_family_with_rho_prior(
                 &family.with_jeffreys_armed(Some(evidence)),
                 warm_specs.as_deref().unwrap_or(specs),
                 options,
                 rho_prior,
-            )
+            );
+            if let Err(e) = &armed {
+                eprintln!("[3228w] {}:{} armed fit refused: {}", file!(), line!(), e.to_string().chars().take(3000).collect::<String>());
+            }
+            armed
         },
     )
 }
@@ -122,8 +131,10 @@ pub fn arm_on_evidence<T, E>(
          {evidence:?}; warm start from the unarmed mode: {}",
         certified.is_some(),
     );
+    eprintln!("[3228w] {}:{} arming on evidence={evidence:?} warm_from_unarmed={}", file!(), line!(), certified.is_some());
     let mut refit = armed(&evidence, certified)?;
     fit_of(&mut refit).artifacts.jeffreys_arming_evidence = Some(evidence);
+    eprintln!("[3228w] {}:{} arm_on_evidence returns armed wiggle={:?}", file!(), line!(), fit_of(&mut refit).block_states.get(2).map(|s| s.beta.to_vec()));
     Ok(refit)
 }
 

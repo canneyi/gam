@@ -1958,6 +1958,7 @@ pub(crate) fn install_reported_posterior_mean<F: CustomFamily + Clone + Send + S
     })?;
     constrained.mode_log_likelihood = Some(inner.log_likelihood);
     set_states_from_flat_beta(&mut inner.block_states, specs, reported_beta)?;
+    eprintln!("[3228w] {}:{} set_states_from_flat_beta(reported posterior mean) wiggle={:?}", file!(), line!(), inner.block_states.get(2).map(|s| s.beta.to_vec()));
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     inner.log_likelihood = family
         .log_likelihood_only(&inner.block_states)

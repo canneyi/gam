@@ -491,6 +491,7 @@ pub(crate) fn assemble_custom_family_fit_result(
                 None => reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas)?,
             };
             let block_states = lift_block_states_to_raw(canonical, inner.block_states);
+            eprintln!("[3228w] {}:{} after lift_block_states_to_raw wiggle={:?}", file!(), line!(), block_states.get(2).map(|s| s.beta.to_vec()));
             let (covariance_conditional, geometry) =
                 lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry)?;
             // The correction is a coefficient-space bilinear form exactly like
@@ -539,6 +540,7 @@ pub(crate) fn assemble_custom_family_fit_result(
     )?;
     fit.artifacts.coefficient_mode_selection = coefficient_mode_selection;
     fit.artifacts.improper_penalty_null_posterior = improper_penalty_null_posterior;
+    eprintln!("[3228w] {}:{} assemble_custom_family_fit_result returns canonical={} wiggle={:?}", file!(), line!(), canonical.is_some(), fit.block_states.get(2).map(|s| s.beta.to_vec()));
     Ok(fit)
 }
 
@@ -3822,6 +3824,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         mut inner,
         psi_scores: _,
     } = mode;
+    eprintln!("[3228w] {}:{} terminal mode bound rho_star={:?} wiggle={:?}", file!(), line!(), rho_star.to_vec(), inner.block_states.get(2).map(|s| s.beta.to_vec()));
     if !mode_hyper_values.is_empty() {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family terminal mode ownership",
@@ -4065,6 +4068,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             }
             (corrected, _) => (corrected, smoothing_correction_absence),
         };
+    eprintln!("[3228w] {}:{} before install_reported_posterior_mean reported_beta_is_some={}", file!(), line!(), reported_beta.is_some());
     install_reported_posterior_mean(
         family,
         specs,
@@ -4076,6 +4080,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         context: "fit_custom_family reported posterior mean",
         reason: reason.to_string(),
     })?;
+    eprintln!("[3228w] {}:{} after install_reported_posterior_mean wiggle={:?}", file!(), line!(), inner.block_states.get(2).map(|s| s.beta.to_vec()));
     let geometry = Some(geometry);
     let deviance = classical_deviance_at_mode(
         family,
@@ -4119,6 +4124,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         },
     )?;
     fit.artifacts.outer_warm_start = Some(outer_warm_start);
+    eprintln!("[3228w] {}:{} fit_custom_family_with_rho_prior returns wiggle={:?}", file!(), line!(), fit.block_states.get(2).map(|s| s.beta.to_vec()));
     Ok(fit)
 }
 

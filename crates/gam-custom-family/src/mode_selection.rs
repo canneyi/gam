@@ -143,6 +143,8 @@ pub(crate) struct ModeSelection {
     pub(crate) certified: usize,
     /// The lowest other certified `f` minus the winner's; `None` with one certified mode.
     pub(crate) runner_up_gap: Option<f64>,
+    /// The other certified candidates, in their order, for a selection that must drop the winner.
+    pub(crate) others: Vec<ModeCandidate>,
 }
 
 /// The index the rule publishes among the certified candidates (`Some`), taken in order: the
@@ -180,11 +182,13 @@ pub(crate) fn select_lowest_penalized(candidates: Vec<ModeCandidate>) -> Option<
         .map(|(_, candidate)| candidate.penalized_objective.value - winner_value)
         .reduce(f64::min);
     let certified = candidates.len();
-    let winner = candidates.into_iter().nth(winner_index)?;
+    let mut others = candidates;
+    let winner = others.remove(winner_index);
     Some(ModeSelection {
         winner,
         certified,
         runner_up_gap,
+        others,
     })
 }
 

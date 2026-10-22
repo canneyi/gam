@@ -3259,6 +3259,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                             builder.fit_blocks(&family, &blocks, options)?
                         }
                     };
+                    eprintln!("[3228w] {}:{} spatial closure fit wiggle={:?}", file!(), line!(), fit.block_states.get(2).map(|s| s.beta.to_vec()));
                     let (mean_beta, noise_beta) = builder
                         .extract_primary_betas(&fit)
                         .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
@@ -3415,6 +3416,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 
     let mut solved = run_exact_joint_spatial!()
         .map_err(|failure| failure.context("exact two-block spatial optimization failed"))?;
+    eprintln!("[3228w] {}:{} run_exact_joint_spatial returns wiggle={:?}", file!(), line!(), solved.fit.block_states.get(2).map(|s| s.beta.to_vec()));
 
     BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
         fit: solved.fit,
@@ -4125,12 +4127,14 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
         kappa_options,
     )?;
 
-    BlockwiseTermWiggleFitResult::try_from_parts(BlockwiseTermWiggleFitResultParts {
+    let result = BlockwiseTermWiggleFitResult::try_from_parts(BlockwiseTermWiggleFitResultParts {
         fit: solved,
         wiggle_knots,
         wiggle_degree,
     })
-    .map_err(assembly_failure)
+    .map_err(assembly_failure)?;
+    eprintln!("[3228w] {}:{} with_selected_wiggle returns wiggle={:?}", file!(), line!(), result.fit.fit.block_states.get(2).map(|s| s.beta.to_vec()));
+    Ok(result)
 }
 
 /// Pin the exact likelihood gauge of the binomial location-scale predictor in

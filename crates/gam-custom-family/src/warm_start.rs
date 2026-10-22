@@ -1576,6 +1576,14 @@ impl CustomOuterState {
                     .warm_cache
                     .as_ref()
                     .is_some_and(|mode| theta_bits(&mode.rho) == key));
+        eprintln!(
+            "[3228i] starts_for theta=[{}] endpoint_hit={} probe_hit={} incumbent_here={} endpoints={}",
+            crate::branch_continuation::i3228_rho(theta),
+            self.walk_endpoints.iter().any(|(bits, _)| *bits == key),
+            self.value_probe.as_ref().is_some_and(|probe| probe.theta == key && probe.seed == SeedIdentity::of(seed)),
+            self.incumbent_established && self.warm_cache.as_ref().is_some_and(|mode| theta_bits(&mode.rho) == key),
+            self.walk_endpoints.len(),
+        );
         let fixed: &[Option<ConstrainedWarmStart>] = if published_here {
             &[]
         } else {
@@ -1705,6 +1713,7 @@ impl CustomOuterState {
     }
 
     fn accept_iterate(&mut self, mode: ConstrainedWarmStart) {
+        eprintln!("[3228i] accept_iterate rho=[{}]", crate::branch_continuation::i3228_rho(&mode.rho));
         self.walk_iterate = Some(mode.clone());
         self.warm_cache = Some(mode);
     }
@@ -1770,6 +1779,7 @@ impl CustomOuterState {
         // walk's certified mode under its θ before the caller's seed replaces the
         // incumbent.
         self.adopt_accepted_steps();
+        eprintln!("[3228i] reset walk_iterate={:?} endpoints_before={}", self.walk_iterate.as_ref().map(|m| crate::branch_continuation::i3228_rho(&m.rho)), self.walk_endpoints.len());
         if let Some(mode) = self.walk_iterate.take() {
             let key = theta_bits(&mode.rho);
             self.walk_endpoints.retain(|(bits, _)| *bits != key);

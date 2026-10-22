@@ -219,6 +219,12 @@ pub(crate) enum BranchContinuationRefusal {
     Evaluation(CustomFamilyError),
 }
 
+pub(crate) fn i3228_rho(rho: &Array1<f64>) -> String {
+    rho.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(",")
+}
+pub(crate) fn i3228_beta(inner: &BlockwiseInnerResult) -> String {
+    inner.block_states.last().map(|s| s.beta.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>().join(",")).unwrap_or_default()
+}
 /// The rho a mode-selection or continuation line names, one rendering for both (gam#3173).
 pub(crate) fn join_rho(rho: &Array1<f64>) -> String {
     rho.iter()
@@ -589,9 +595,12 @@ fn certified_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// incumbent the continuation does not cover, is solved directly at `rho`, as the seed rules chose
 /// it, and a start whose solve is refused at this trial point drops out too. A fixed start whose
 /// seed is the incumbent's is the same computation and is not repeated, and one start is its own
-/// selection. The evaluation refuses only when no start certified a mode, and then with the
-/// incumbent's refusal. Any other error is a failure of the evaluation, not of a start, and is
-/// returned as it is.
+/// selection. Among several starts, a selected mode whose criterion is refused at this trial point
+/// drops out as well, and the next-lowest is priced: the rule the exact-joint evaluator applies to
+/// a mode it cannot price (`evaluate_custom_family_joint_hyper_best_mode_shared`). The evaluation
+/// refuses only when no start certified a mode it can price, with the first pricing refusal, or
+/// with the incumbent's refusal when no start certified a mode. Any other error is a failure of
+/// the evaluation, not of a start, and is returned as it is.
 ///
 /// Where the continuation does not cover the family's solve, nothing follows the published mode to
 /// its fold, so the published mode's own fold record is read after it is priced: where its barrier
@@ -634,6 +643,13 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
         .filter(|(_, seed)| SeedIdentity::of(seed.as_ref()) != incumbent_seed)
         .map(|(index, seed)| (index, seed.as_ref()))
         .collect();
+    eprintln!(
+        "[3228i] eval rho=[{}] mode={eval_mode:?} incumbent_seed_rho={:?} fixed={} rivals={}",
+        i3228_rho(rho),
+        starts.incumbent.map(|s| i3228_rho(&s.rho)),
+        starts.fixed.len(),
+        rivals.len(),
+    );
     let incumbent = match starts
         .incumbent
         .filter(|seed| continues_its_branch(family, specs, options, layout, seed, rho))
@@ -663,6 +679,7 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
                 .map_err(dropped_or_failed)
             }
             Err(refusal @ BranchContinuationRefusal::FoldReached { .. }) => {
+                eprintln!("[3228i]   incumbent continuation FoldReached: {refusal}");
                 log::debug!("[branch continuation] ended: {refusal}");
                 Err(Ok(refusal.into_trial_point()))
             }
@@ -687,15 +704,25 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
     let mut incumbent_mode_excess: Option<f64> = None;
     // The incumbent's own penalized objective, where a selection priced it.
     let mut incumbent_penalized: Option<PenalizedObjective> = None;
-    let published = if rivals.is_empty() {
-        match incumbent {
+    match &incumbent {
+        Ok(inner) => eprintln!("[3228i]   incumbent ok wiggle=[{}]", i3228_beta(inner)),
+        Err(Ok(r)) => eprintln!("[3228i]   incumbent dropped: {}", r.to_string().chars().take(300).collect::<String>()),
+        Err(Err(r)) => eprintln!("[3228i]   incumbent error: {}", r.to_string().chars().take(300).collect::<String>()),
+    }
+    let mut result = if rivals.is_empty() {
+        let published = match incumbent {
             Ok(inner) => inner,
             Err(Ok(refusal) | Err(refusal)) => return Err(refusal),
-        }
+        };
+        outerobjective_from_coefficient_mode_labeled(
+            family, specs, options, layout, rho, rho_prior, published, eval_mode,
+        )
+        .inspect_err(|e| eprintln!("[3228i]   pricing refused (sole start): {}", e.to_string().chars().take(200).collect::<String>()))?
     } else {
         let roots = penalty_roots()?;
         let candidate = |start: ModeStart, inner: BlockwiseInnerResult| {
             penalized_objective_at_mode(family, specs, &roots, &inner).map(|penalized_objective| {
+                eprintln!("[3228i]   candidate start={start} f={:.15e} wiggle=[{}]", penalized_objective.value, i3228_beta(&inner));
                 ModeCandidate {
                     start,
                     inner,
@@ -717,56 +744,81 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
         for &(index, seed) in &rivals {
             match direct(seed) {
                 Ok(inner) => candidates.push(candidate(ModeStart::FixedSeed(index), inner)?),
-                Err(refusal) if refusal.is_trial_point_infeasible() => log::debug!(
-                    "[mode selection #3173] rho=[{}]: fixed seed {index} certified no mode: \
-                     {refusal}",
-                    join_rho(rho)
+                Err(refusal) if refusal.is_trial_point_infeasible() => eprintln!(
+                    "[3228i]   fixed seed {index} certified no mode: {}",
+                    refusal.to_string().chars().take(300).collect::<String>()
                 ),
                 Err(error) => return Err(error),
             }
         }
-        let Some(selection) = select_lowest_penalized(candidates) else {
-            return Err(incumbent_refusal.unwrap_or_else(|| {
-                CustomFamilyError::trial_point(format!(
-                    "no start certified an inner mode at rho=[{}]",
-                    join_rho(rho)
-                ))
-            }));
-        };
-        // The incumbent's own mode lost, and by more than comparing the two can round by: at
-        // this θ the branch the outer walk carries is not the posterior branch (gam#3173).
-        incumbent_mode_excess = incumbent_penalized.and_then(|incumbent| {
-            (selection.winner.start != ModeStart::Incumbent
-                && selection
-                    .winner
-                    .penalized_objective
-                    .resolvably_below(&incumbent))
-            .then(|| incumbent.value - selection.winner.penalized_objective.value)
-        });
-        log::debug!(
-            "[mode selection #3173] rho=[{}]: {} of {} start(s) certified a mode; published the \
-             {} mode, f={:.9e}; runner-up gap {}; incumbent {}",
-            join_rho(rho),
-            selection.certified,
-            rivals.len() + 1,
-            selection.winner.start,
-            selection.winner.penalized_objective.value,
-            selection
-                .runner_up_gap
-                .map_or_else(|| "none".to_string(), |gap| format!("{gap:.3e}")),
-            incumbent_refusal.as_ref().map_or_else(
-                || match incumbent_mode_excess {
-                    Some(excess) => format!("certified, above the published mode by {excess:.3e}"),
-                    None => "certified".to_string(),
-                },
-                |refusal| format!("dropped: {refusal}")
-            ),
-        );
-        selection.winner.inner
+        // The first refusal to price a selected mode, returned when no certified mode prices.
+        let mut pricing_refusal: Option<CustomFamilyError> = None;
+        loop {
+            let Some(selection) = select_lowest_penalized(candidates) else {
+                return Err(pricing_refusal.or(incumbent_refusal).unwrap_or_else(|| {
+                    CustomFamilyError::trial_point(format!(
+                        "no start certified an inner mode at rho=[{}]",
+                        join_rho(rho)
+                    ))
+                }));
+            };
+            // The incumbent's own mode lost, and by more than comparing the two can round by: at
+            // this θ the branch the outer walk carries is not the posterior branch (gam#3173).
+            incumbent_mode_excess = incumbent_penalized.and_then(|incumbent| {
+                (selection.winner.start != ModeStart::Incumbent
+                    && selection
+                        .winner
+                        .penalized_objective
+                        .resolvably_below(&incumbent))
+                .then(|| incumbent.value - selection.winner.penalized_objective.value)
+            });
+            log::debug!(
+                "[mode selection #3173] rho=[{}]: {} of {} start(s) certified a mode; published the \
+                 {} mode, f={:.9e}; runner-up gap {}; incumbent {}",
+                join_rho(rho),
+                selection.certified,
+                rivals.len() + 1,
+                selection.winner.start,
+                selection.winner.penalized_objective.value,
+                selection
+                    .runner_up_gap
+                    .map_or_else(|| "none".to_string(), |gap| format!("{gap:.3e}")),
+                incumbent_refusal.as_ref().map_or_else(
+                    || match incumbent_mode_excess {
+                        Some(excess) => format!("certified, above the published mode by {excess:.3e}"),
+                        None => "certified".to_string(),
+                    },
+                    |refusal| format!("dropped: {refusal}")
+                ),
+            );
+            let start = selection.winner.start;
+            eprintln!("[3228i]   selected {start} excess={incumbent_mode_excess:?} wiggle=[{}]", i3228_beta(&selection.winner.inner));
+            match outerobjective_from_coefficient_mode_labeled(
+                family,
+                specs,
+                options,
+                layout,
+                rho,
+                rho_prior,
+                selection.winner.inner,
+                eval_mode,
+            ) {
+                Ok(priced) => break priced,
+                Err(refusal) if refusal.is_trial_point_infeasible() => {
+                    eprintln!("[3228i]   pricing refused {start}, drops out: {}", refusal.to_string().chars().take(200).collect::<String>());
+                    log::debug!(
+                        "[mode selection #3173] rho=[{}]: the {start} mode's criterion was \
+                         refused at this trial point, so it drops out: {refusal}",
+                        join_rho(rho)
+                    );
+                    pricing_refusal.get_or_insert(refusal);
+                    candidates = selection.others;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     };
-    let mut result = outerobjective_from_coefficient_mode_labeled(
-        family, specs, options, layout, rho, rho_prior, published, eval_mode,
-    )?;
+    eprintln!("[3228i]   priced V={:.15e} wiggle=[{}]", result.objective, i3228_beta(&result.inner));
     // gam#3173: one start past the saddle of the published mode, where its own fold record says
     // the barrier to the next basin is below the correction the Laplace series makes for it
     // ([`fold_crossing_seed`]). Where the continuation covers the family's solve, the walk's
@@ -785,6 +837,7 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
                 let published_f =
                     penalized_objective_at_mode(family, specs, &roots, &result.inner)?;
                 let crossed_f = penalized_objective_at_mode(family, specs, &roots, &crossed)?;
+                eprintln!("[3228i]   fold crossing f={:.15e} vs published {:.15e} wiggle=[{}]", crossed_f.value, published_f.value, i3228_beta(&crossed));
                 if crossed_f.resolvably_below(&published_f) {
                     log::debug!(
                         "[mode selection #3173] rho=[{}]: the start past the published mode's \
@@ -803,7 +856,8 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
                         incumbent_f.map(|incumbent| incumbent.value - crossed_f.value);
                     result = outerobjective_from_coefficient_mode_labeled(
                         family, specs, options, layout, rho, rho_prior, crossed, eval_mode,
-                    )?;
+                    ).inspect_err(|e| eprintln!("[3228i]   crossing pricing refused: {}", e.to_string().chars().take(200).collect::<String>()))?;
+                    eprintln!("[3228i]   crossing published V={:.15e}", result.objective);
                 } else {
                     log::debug!(
                         "[mode selection #3173] rho=[{}]: the start past the published mode's \
@@ -814,8 +868,8 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
                     );
                 }
             }
-            Err(refusal) if refusal.is_trial_point_infeasible() => log::debug!(
-                "[mode selection #3173] rho=[{}]: the start past the published mode's saddle \
+            Err(refusal) if refusal.is_trial_point_infeasible() => eprintln!(
+                "[3228i] [mode selection #3173] rho=[{}]: the start past the published mode's saddle \
                  certified no mode: {refusal}",
                 join_rho(rho)
             ),
