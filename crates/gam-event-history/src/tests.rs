@@ -1,6 +1,6 @@
 use super::chain::{
-    AtomTransition, FactorMark, ForwardKernel, GaussHermite, Grid, LogFactor, SplitDensity,
-    backward_axis_bases, interpolate_at_inner_points,
+    AtomTransition, FactorMark, ForwardKernel, GaussHermite, Grid, LogFactor, LogRatioCap,
+    SplitDensity, backward_axis_bases, interpolate_at_inner_points,
 };
 use super::cohort::{
     CovariateSegment, Event, EventHistoryCohort, MarkKind, SubjectHistory, SubjectNodes,
@@ -237,8 +237,9 @@ fn a_forward_step_interpolates_no_node_factor_2964() {
                 constant: 0.0,
             },
         };
-        let kernel = ForwardKernel::new(&gh, &from, &density, &to, &[AtomTransition::new(&kappa)]);
-        let predicted = kernel.log_predicted(to.size());
+        let cap = LogRatioCap::new(default_tolerance()).expect("cap");
+        let kernel = ForwardKernel::new(&gh, &from, &density, &to, &[AtomTransition::new(&kappa)], cap);
+        let predicted = kernel.log_predicted(&to, "the 2964 fixture").expect("prediction");
         let mut error = 0.0_f64;
         for (j, &log_p) in predicted.iter().enumerate() {
             let z = *to.coordinate(j, 0);
@@ -275,9 +276,10 @@ fn forward_kernel_is_exact_on_a_gaussian() {
     let log_alpha: Vec<f64> = (0..from.size())
         .map(|i| gaussian(*from.coordinate(i, 0), mu0, sigma0 * sigma0).ln())
         .collect();
+    let cap = LogRatioCap::new(default_tolerance()).expect("cap");
     let kernel =
-        ForwardKernel::new(&gh, &from, &SplitDensity::whole(&log_alpha), &to, &[transition.clone()]);
-    let predicted = kernel.log_predicted(to.size());
+        ForwardKernel::new(&gh, &from, &SplitDensity::whole(&log_alpha), &to, &[transition.clone()], cap);
+    let predicted = kernel.log_predicted(&to, "a Gaussian").expect("prediction");
     let tau2 = phi * phi * sigma0 * sigma0 + q;
     for j in 0..to.size() {
         let z = *to.coordinate(j, 0);
@@ -349,6 +351,7 @@ fn single_node_marginal_matches_numerical_integration() {
         continuation_gap: 0.0,
         designs: None,
         log_normaliser: None,
+        tolerance: default_tolerance(),
     };
     let out = subject_marginal(&inputs, Evaluation::Value).expect("marginal");
     // ∫ exp(y η − w e^η) N(z) dz with η = η0 − ½a² + a z, on a fine grid.
@@ -387,6 +390,7 @@ fn two_node_marginal_matches_brute_force_double_integral() {
         continuation_gap: 0.0,
         designs: None,
         log_normaliser: None,
+        tolerance: default_tolerance(),
     };
     let out = subject_marginal(&inputs, Evaluation::Value).expect("marginal");
     let phi = (-(1.2_f64 * 0.7)).exp();
@@ -439,6 +443,7 @@ fn zero_loadings_reduce_to_the_poisson_likelihood() {
         continuation_gap: 0.0,
         designs: None,
         log_normaliser: None,
+        tolerance: default_tolerance(),
     };
     let out = subject_marginal(&inputs, with_derivatives()).expect("marginal");
     let mut expected = 0.0;
@@ -490,6 +495,12 @@ fn finite_difference_subject() -> (SubjectNodes, Vec<f64>, Vec<f64>, Vec<f64>) {
     (nodes, eta0, loadings, rates)
 }
 
+/// The default quadrature tolerance: the accuracy a fit certifies its grid
+/// to, which every forward kernel's cap reads.
+fn default_tolerance() -> f64 {
+    EventHistorySpec::new(Vec::new()).quadrature_tolerance
+}
+
 /// The derivative pass at the default quadrature tolerance, the accuracy a
 /// fit certifies its grid to.
 fn with_derivatives() -> Evaluation {
@@ -519,6 +530,7 @@ fn evaluate_at(
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: None,
+            tolerance: default_tolerance(),
         },
         with_derivatives(),
     )
@@ -599,6 +611,7 @@ fn directional_duals_match_finite_differences_of_the_hessian() {
                 continuation_gap: 0.0,
                 designs: None,
                 log_normaliser: None,
+                tolerance: default_tolerance(),
             },
             with_derivatives(),
         )
@@ -641,6 +654,7 @@ fn directional_duals_match_finite_differences_of_the_hessian() {
                 continuation_gap: 0.0,
                 designs: None,
                 log_normaliser: None,
+                tolerance: default_tolerance(),
             },
             with_derivatives(),
         )
@@ -2419,6 +2433,7 @@ fn smallest_prefix_with_non_finite_louis_output_at_order_21() {
                 continuation_gap: 0.0,
                 designs: None,
                 log_normaliser: None,
+                tolerance: default_tolerance(),
             };
             match subject_marginal(&inputs, with_derivatives()) {
                 Ok(out) => {
@@ -2471,6 +2486,7 @@ fn smallest_prefix_with_non_finite_louis_output_at_order_21() {
                     continuation_gap: 0.0,
                 designs: None,
                 log_normaliser: None,
+                tolerance: default_tolerance(),
             };
                 subject_marginal(&inputs, with_derivatives()).map(|o| {
                     (
@@ -2783,6 +2799,7 @@ fn dual_loading_derivative_matches_finite_difference_at_zero_loading() {
                 continuation_gap: 0.0,
                 designs: None,
                 log_normaliser: None,
+                tolerance: default_tolerance(),
             };
             subject_marginal(&inputs, Evaluation::Value).expect("value").loglik
         };
@@ -2797,6 +2814,7 @@ fn dual_loading_derivative_matches_finite_difference_at_zero_loading() {
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: None,
+            tolerance: default_tolerance(),
         };
         let dual = subject_marginal(&inputs, Evaluation::Value).expect("dual").loglik;
         let h = 1e-5;
@@ -5114,6 +5132,7 @@ fn the_risk_set_normaliser_matches_an_independent_quadrature_of_the_population()
         &gh,
         &[MarkKind::Once],
         1,
+        default_tolerance(),
     )
     .expect("reference population");
     let (expected, expected_mass) =
@@ -5211,6 +5230,7 @@ fn without_loadings_the_two_centrings_are_the_same_model() {
         &gh,
         &[MarkKind::Once, MarkKind::Terminal],
         1,
+        default_tolerance(),
     )
     .expect("reference population");
     let largest = out
@@ -5446,7 +5466,7 @@ fn production_reference_grid_converges_to_the_survival_identity() {
         let times: Vec<f64> = (0..=intervals).map(|n| 6.0 * n as f64 / intervals as f64).collect();
         let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
         let out = stratum_normalisers(&grid, &vec![baseline; intervals + 1], &[0.9], &[1e-8],
-            1.0, &gh, &[MarkKind::Once], 1).unwrap();
+            1.0, &gh, &[MarkKind::Once], 1, default_tolerance()).unwrap();
         errors.push((out.log_risk_mass.last().unwrap().exp() - target).abs());
     }
     emit(&format!("continuous-time survival errors: {errors:?}"));
@@ -5521,7 +5541,8 @@ fn reference_midpoint_refuses_only_a_step_that_does_not_contract_2627() {
     let evolve = |intervals: usize, loading: f64| {
         let times: Vec<f64> = (0..=intervals).map(|n| 6.0 * n as f64 / intervals as f64).collect();
         let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
-        stratum_normalisers(&grid, &vec![0.0; intervals + 1], &[loading], &[1e-6], 1.0, &gh, &[MarkKind::Once], 1)
+        stratum_normalisers(&grid, &vec![0.0; intervals + 1], &[loading], &[1e-6], 1.0, &gh, &[MarkKind::Once], 1,
+            default_tolerance())
     };
     match evolve(2, 2.0) {
         Err(super::cohort::EventHistoryError::ReferenceStep { interval, change, contraction, band }) => {
@@ -5567,6 +5588,7 @@ fn reference_midpoint_derivative_channels_converge_with_the_value_2627() {
             &gh,
             &[MarkKind::Once],
             1,
+            default_tolerance(),
         )
         .expect("a loading of 2 contracts at step 1")
         .log_normaliser

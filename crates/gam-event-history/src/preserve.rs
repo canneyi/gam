@@ -6,7 +6,7 @@
 //! killing step. Finite steps approximate that identity; the fitting driver
 //! must resolve both normalisers and risk masses by time refinement.
 //!
-use super::chain::{GaussHermite, Grid, SplitDensity, log_standard_prior, log_sum_exp};
+use super::chain::{GaussHermite, Grid, LogRatioCap, SplitDensity, log_standard_prior, log_sum_exp};
 use super::cohort::{EventHistoryError, MarkKind};
 use super::marginal::{condition, conditioned_density, node_likelihood, predict, transitions_across};
 use super::scalar::ln;
@@ -279,9 +279,11 @@ fn kill<S: JetField>(
 
 /// Evolve from the reference entry to each endpoint, reporting the law AT
 /// that time. Every coefficient derivative propagates through the same steps.
+/// `tolerance` is the relative accuracy the fit's quadrature is certified to;
+/// every forward kernel of the evolution is capped by it ([`LogRatioCap`]).
 pub(crate) fn stratum_normalisers<S: JetField>(
     grid: &ReferenceGrid, eta0: &[S], loadings: &[S], rates: &[S],
-    time_scale: f64, gh: &GaussHermite, kinds: &[MarkKind], atoms: usize,
+    time_scale: f64, gh: &GaussHermite, kinds: &[MarkKind], atoms: usize, tolerance: f64,
 ) -> Result<Normalisers<S>, EventHistoryError> {
     let marks = kinds.len();
     let nodes = grid.len();
@@ -296,6 +298,7 @@ pub(crate) fn stratum_normalisers<S: JetField>(
         });
     }
     let (masks, of_mark) = killing_masks(kinds);
+    let cap = LogRatioCap::new(tolerance)?;
     let like = &eta0[0];
     let zero: Vec<S> = (0..atoms).map(|_| like.constant_like(0.0)).collect();
     let unit: Vec<S> = (0..atoms).map(|_| like.constant_like(1.0)).collect();
@@ -314,7 +317,7 @@ pub(crate) fn stratum_normalisers<S: JetField>(
         let diffuse = |populations: &[(Grid<S>, Vec<S>)], densities: &[SplitDensity<S>]|
             -> Result<Vec<(Grid<S>, Vec<S>)>, EventHistoryError> {
             populations.iter().zip(densities).map(|((grid, log_density), density)|
-                predict(gh, like, grid, log_density, density, &transitions,
+                predict(gh, like, grid, log_density, density, &transitions, cap,
                     "reference population")).collect()
         };
         // Every population entering a step is a predicted density (or the

@@ -153,6 +153,7 @@ impl PredictionModel<'_> {
             atoms: self.atoms,
             time_scale: self.time_scale,
             gh: self.gh,
+            tolerance: self.quadrature_tolerance,
         };
         let loadings = &beta[latent_offset..latent_offset + self.marks * self.atoms];
         let values = reference_normalisers(tables, &shape, beta, loadings, &rates)?;

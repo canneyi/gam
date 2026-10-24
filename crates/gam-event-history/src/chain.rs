@@ -36,7 +36,8 @@
 
 use super::cohort::EventHistoryError;
 use super::scalar::{add_real, div, exp, ln, recip, sqrt, square};
-use gam_math::nested_dual::JetField;
+use gam_math::nested_dual::{JET_ORDER_CAP, JetField};
+use gam_math::roundoff::accumulation_growth;
 
 /// Physicists' Gauss-Hermite rule with the derived constants the chain uses.
 #[derive(Clone, Debug)]
@@ -598,6 +599,24 @@ pub(crate) struct ForwardKernel<S> {
     /// The explicit factor `f` of the source density, evaluated at the inner
     /// points of each row.
     factor: LogFactor<S>,
+    /// The cap on the interpolated `ln r` at the inner points.
+    cap: LogRatioCap,
+    /// The corners of the cap's level at every inner coordinate,
+    /// `[k][j_k G + l]` ([`AxisCorners`]). Empty when the kernel interpolates
+    /// over no axis, or below order three, where no secant has a node beyond
+    /// it; the cap is then off.
+    corners: Vec<Vec<AxisCorners<S>>>,
+    /// The same corners as values, for the check every inner point takes
+    /// before any jet of the level is formed.
+    corner_values: Vec<Vec<AxisCorners<f64>>>,
+    /// The values of `log_ratio`.
+    log_ratio_values: Vec<f64>,
+    /// `M = max_i |ln r_i|`, the scale of the rounding in the interpolant and
+    /// the level.
+    log_ratio_bound: f64,
+    /// `δ`: the rounding forming `ln r` leaves at a node, `γ_{4K+1}` of the
+    /// largest sum of magnitudes it adds.
+    nodal_rounding: f64,
 }
 
 /// One target point of a [`ForwardKernel`]: the log predicted density there
@@ -605,6 +624,10 @@ pub(crate) struct ForwardKernel<S> {
 pub(crate) struct KernelRow<S> {
     pub log_predicted: S,
     pub weights: Vec<S>,
+    /// The share of the row's inner mass drawn from inner points where the
+    /// interpolated `ln r` exceeded the cap's level by more than rounding
+    /// ([`LogRatioCap`]). A check, not a differentiated quantity.
+    pub limited: f64,
 }
 
 /// One mark's Poisson node term `y η − Δ e^{η}` with `η = b + Σ_k a_k z_k`,
@@ -697,6 +720,245 @@ impl<S: JetField> SplitDensity<S> {
     }
 }
 
+/// The cap on the forward kernel's interpolated `ln r` (gam#4594).
+///
+/// Every smooth part a kernel reads is log-concave in `z`: the stationary
+/// prior is a Gaussian, a node factor `y η − Δ e^{η}` is concave in the affine
+/// `η`, a Gaussian transition carries a log-concave density to a log-concave
+/// one (Prékopa), and a normalising constant changes nothing. So
+/// `h = ln r − Σ_k x_k²` is concave in the standardised coordinate `x`, and
+/// at every inner point the hat-weighted blend of the secants through the
+/// nearest nodes, extended to the point, bounds the true `ln r` from above
+/// ([`AxisCorners`]). Near the hull edge the Lagrange interpolant amplifies
+/// the error of `ln r`'s nodal values and its own approximation error by the
+/// Lebesgue function, and `exp` turns an upward error into mass the filter
+/// then compounds. An interpolant above the level is wrong by at least its
+/// excess `y = p − L`, and the kernel keeps `L + c(y)` instead: `c(y) = y` for
+/// `y ≤ 0`, `y − w P(y/w)` on `(0, w)` and `5w/9` beyond, with
+/// `P = ∫ I_t(5, 4)`. `c` meets the identity with five matching derivatives
+/// and the plateau with `JET_ORDER_CAP`, so an engagement at rounding level
+/// moves no derivative channel and every channel stays the exact derivative
+/// of the computed value. The plateau is `ln(1 + tolerance)`: the most the
+/// cap lets a value exceed a valid upper bound is the relative accuracy the
+/// fit certifies.
+///
+/// The cap is one-sided, so it leaves the rounding the certificate charges
+/// unchanged: where it does not engage the kernel is the interpolant, whose
+/// pointwise amplification `λ` reaches the Lebesgue constant, and where it
+/// engages the value moves with the level, whose amplification `C` stays
+/// below it ([`AxisCorners::multiplier`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogRatioCap {
+    tolerance: f64,
+    width: f64,
+}
+
+/// `a / (a + b)` for `I_t(5, 4)`: the cap's plateau as a fraction of its width.
+const PLATEAU: f64 = 5.0 / 9.0;
+// `LogRatioCap::stack` writes out `I_t(5, 4)` and its antiderivative for
+// this jet order.
+const _: () = assert!(JET_ORDER_CAP == 4);
+
+impl LogRatioCap {
+    /// The cap for a fit whose quadrature is certified to the relative
+    /// accuracy `tolerance`.
+    pub fn new(tolerance: f64) -> Result<Self, EventHistoryError> {
+        if !(tolerance.is_finite() && tolerance > 0.0) {
+            return Err(EventHistoryError::InvalidInput {
+                reason: format!(
+                    "the forward kernel's cap needs a positive finite tolerance, not {tolerance}"
+                ),
+            });
+        }
+        Ok(Self { tolerance, width: tolerance.ln_1p() / PLATEAU })
+    }
+
+    /// `[c, c′, c″, c‴, c⁗]` at `y > 0`. The value and the slope are formed
+    /// from the nearer end of `(0, w)`, so neither cancels.
+    fn stack(&self, y: f64) -> [f64; JET_ORDER_CAP + 1] {
+        let w = self.width;
+        if y >= w {
+            return [PLATEAU * w, 0.0, 0.0, 0.0, 0.0];
+        }
+        let t = y / w;
+        let s = 1.0 - t;
+        let (value, slope) = if t <= 0.5 {
+            // `P(t)` and `I_t(5, 4)`.
+            let p = t.powi(6) * (28.0 / 3.0 + t * (-20.0 + t * (15.0 - 35.0 / 9.0 * t)));
+            let smooth_step = t.powi(5) * (56.0 + t * (-140.0 + t * (120.0 - 35.0 * t)));
+            (y - w * p, 1.0 - smooth_step)
+        } else {
+            // `∫_0^s I_σ(4, 5) dσ = 5/9 − (t − P(t))` and `I_s(4, 5) = 1 − I_t(5, 4)`.
+            let q = s.powi(5)
+                * (14.0 + s * (-112.0 / 3.0 + s * (40.0 + s * (-20.0 + 35.0 / 9.0 * s))));
+            let complement =
+                s.powi(4) * (70.0 + s * (-224.0 + s * (280.0 + s * (-160.0 + 35.0 * s))));
+            (PLATEAU * w - w * q, complement)
+        };
+        [
+            value,
+            slope,
+            -280.0 * t.powi(4) * s.powi(3) / w,
+            -280.0 * t.powi(3) * s * s * (4.0 - 7.0 * t) / (w * w),
+            -1680.0 * t * t * s * (t * (7.0 * t - 8.0) + 2.0) / (w * w * w),
+        ]
+    }
+
+    /// `level + c(p − level)`: `p` itself, bit for bit, unless it exceeds `level`.
+    pub fn apply<S: JetField>(&self, p: &S, level: &S) -> S {
+        let excess = p.sub(level);
+        let y = excess.value();
+        if !(y > 0.0) {
+            return p.clone();
+        }
+        level.add(&excess.compose_unary(self.stack(y)))
+    }
+
+    /// The largest share of a predicted mass that may come from inner points
+    /// the cap limited. A limited point's true mass lies between zero and its
+    /// capped mass, so a share `ψ` can hide a relative overestimate of the
+    /// predicted mass of `ψ / (1 − ψ)`, which is `tolerance` at
+    /// `ψ = tolerance / (1 + tolerance)`.
+    pub fn admitted_share(&self) -> f64 {
+        self.tolerance / (1.0 + self.tolerance)
+    }
+}
+
+/// The share of a target grid's predicted mass that its kernel rows drew from
+/// inner points the cap limited beyond rounding ([`KernelRow::limited`]),
+/// summed in the log domain so that no mass under- or overflows.
+pub(crate) struct LimitedShare {
+    top: f64,
+    total: f64,
+    limited: f64,
+}
+
+impl LimitedShare {
+    pub fn new() -> Self {
+        Self { top: f64::NEG_INFINITY, total: 0.0, limited: 0.0 }
+    }
+
+    /// Adds a target point of log mass `log_mass` (its log weight plus its
+    /// log predicted density) whose row drew `limited` of its inner mass from
+    /// limited points. A point of no finite mass adds nothing; the consumers
+    /// of the prediction report it.
+    pub fn add(&mut self, log_mass: f64, limited: f64) {
+        if !log_mass.is_finite() {
+            return;
+        }
+        if log_mass > self.top {
+            let scale = (self.top - log_mass).exp();
+            self.total *= scale;
+            self.limited *= scale;
+            self.top = log_mass;
+        }
+        let mass = (log_mass - self.top).exp();
+        self.total += mass;
+        self.limited += mass * limited;
+    }
+
+    /// Refuses a prediction whose limited share exceeds what `cap` admits.
+    pub fn check(&self, cap: &LogRatioCap, label: &str) -> Result<(), EventHistoryError> {
+        let share = self.limited / self.total;
+        // A grid with no finite mass gives NaN here, which compares false.
+        if share > cap.admitted_share() {
+            return Err(EventHistoryError::NumericalFailure {
+                reason: format!(
+                    "{label}: {share:.3e} of the predicted mass came from inner points where the \
+                     interpolated ln r exceeded its concavity bound by more than rounding; the \
+                     quadrature is certified to {:.3e}",
+                    cap.tolerance
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The corners one axis contributes to the cap's level at one inner
+/// coordinate `v` ([`LogRatioCap`]), with the jets of what the level reads
+/// off `v`.
+///
+/// For a concave `h` and a node `c` with a neighbour `b` on the far side of
+/// `c` from `v`, the secant through `b` and `c` extended to `v` lies above
+/// `h(v)`: with `t = (v − x_c)/(x_c − x_b) ≥ 0`, `x_c` is the convex
+/// combination `(v + t x_b)/(1 + t)`, and concavity at it rearranges to
+/// `h(v) ≤ h(c) + t (h(c) − h(b))`. Over several axes the same holds with
+/// one back node per axis, `h(v) ≤ h(c) + Σ_k t_k (h(c) − h(c^{(k)}))`. Inside
+/// the cell `[x_a, x_{a+1}]` both ends serve, each with its far neighbour,
+/// blended with the hat weights `1 − u` and `u`: a convex combination of
+/// bounds, continuous across cell faces and tight at interior nodes. Below
+/// `x_1` and above `x_{G−2}` one corner serves, the second or second-to-last
+/// node with its inward neighbour, so the bound continues past the hull with
+/// no proviso.
+#[derive(Clone, Debug)]
+struct AxisCorners<T> {
+    count: usize,
+    corner: [usize; 2],
+    back: [usize; 2],
+    /// The hat weight of each corner.
+    weight: [T; 2],
+    /// `t` of each corner's secant.
+    reach: [T; 2],
+    /// `m = Σ_c ω_c (v − x_c)(v − x_b) ≥ 0`, what the blended secants of
+    /// `x²` fall short of `v²`. `ln r` carries the envelope's `x²` and only
+    /// `ln r − x²` is concave, so the level adds `m` back.
+    shortfall: T,
+    /// `Σ_c ω_c (1 + 2 t_c)`: the absolute coefficients the blend puts on the
+    /// nodal values it reads, so the factor by which it carries their errors.
+    multiplier: f64,
+    /// `Σ_i |B_i(v)|`: the Lebesgue function of the kernel's basis at `v`.
+    lebesgue: f64,
+}
+
+impl<T: JetField> AxisCorners<T> {
+    /// The corners at the inner coordinate `raw`, at which the kernel's basis is `basis`.
+    fn new(nodes: &[f64], raw: &T, basis: &[T]) -> Self {
+        let g = nodes.len();
+        let v = raw.value();
+        let (count, corner, back) = if v <= nodes[1] {
+            (1, [1, 1], [2, 2])
+        } else if v >= nodes[g - 2] {
+            (1, [g - 2, g - 2], [g - 3, g - 3])
+        } else {
+            let a = nodes.partition_point(|&x| x <= v) - 1;
+            (2, [a, a + 1], [a - 1, a + 2])
+        };
+        let weight = if count == 1 {
+            [raw.constant_like(1.0), raw.constant_like(0.0)]
+        } else {
+            let u = add_real(raw, -nodes[corner[0]]).scale(1.0 / (nodes[corner[1]] - nodes[corner[0]]));
+            [add_real(&u.neg(), 1.0), u]
+        };
+        let reach = [0, 1].map(|c| {
+            add_real(raw, -nodes[corner[c]]).scale(1.0 / (nodes[corner[c]] - nodes[back[c]]))
+        });
+        let mut shortfall = raw.constant_like(0.0);
+        let mut multiplier = 0.0;
+        for c in 0..count {
+            let product = add_real(raw, -nodes[corner[c]]).mul(&add_real(raw, -nodes[back[c]]));
+            shortfall = shortfall.add(&weight[c].mul(&product));
+            multiplier += weight[c].value() * (1.0 + 2.0 * reach[c].value());
+        }
+        let lebesgue = basis.iter().map(|b| b.value().abs()).sum();
+        Self { count, corner, back, weight, reach, shortfall, multiplier, lebesgue }
+    }
+
+    /// The same corners with every jet reduced to its value.
+    fn values(&self) -> AxisCorners<f64> {
+        AxisCorners {
+            count: self.count,
+            corner: self.corner,
+            back: self.back,
+            weight: [self.weight[0].value(), self.weight[1].value()],
+            reach: [self.reach[0].value(), self.reach[1].value()],
+            shortfall: self.shortfall.value(),
+            multiplier: self.multiplier,
+            lebesgue: self.lebesgue,
+        }
+    }
+}
+
 impl<S: JetField> ForwardKernel<S> {
     pub fn new(
         gh: &GaussHermite,
@@ -704,6 +966,7 @@ impl<S: JetField> ForwardKernel<S> {
         density: &SplitDensity<S>,
         to: &Grid<S>,
         transitions: &[AtomTransition<S>],
+        cap: LogRatioCap,
     ) -> Self {
         let g = gh.order;
         let atoms = from.dimension();
@@ -720,10 +983,27 @@ impl<S: JetField> ForwardKernel<S> {
                 })
             })
             .collect();
+        // Forming `ln r_i` rounds four times per axis, and `ln σ_k` once more,
+        // on terms no larger than the ones added here.
+        let nodal_magnitude = density
+            .smooth
+            .iter()
+            .enumerate()
+            .map(|(i, log_a)| {
+                (0..atoms).fold(log_a.value().abs(), |acc, k| {
+                    let x = gh.nodes[from.index(i, k)];
+                    acc + log_sigma[k].value().abs() + x * x + LOG_SQRT_TWO_PI
+                })
+            })
+            .fold(0.0_f64, f64::max);
+        let log_ratio_values: Vec<f64> = log_ratio.iter().map(|v| v.value()).collect();
+        let log_ratio_bound = log_ratio_values.iter().fold(0.0_f64, |bound, v| bound.max(v.abs()));
+        let capped = g >= 3;
         let mut bases = Vec::with_capacity(atoms);
         let mut log_gauss = Vec::with_capacity(atoms);
         let mut innovations = Vec::with_capacity(atoms);
         let mut coordinates = Vec::with_capacity(atoms);
+        let mut corners = Vec::with_capacity(atoms);
         for (axis, transition) in transitions.iter().enumerate() {
             let old = &from.axes[axis];
             let new = &to.axes[axis];
@@ -751,6 +1031,7 @@ impl<S: JetField> ForwardKernel<S> {
             let mut axis_gauss = Vec::with_capacity(g);
             let mut axis_innovations = Vec::with_capacity(g * g);
             let mut axis_coordinates = Vec::with_capacity(g * g);
+            let mut axis_corners = Vec::with_capacity(if capped { g * g } else { 0 });
             for j in 0..g {
                 let d = new.points[j].sub(&phi_mu);
                 axis_gauss.push(log_normal_density(&new.points[j], &phi_mu, &tau2));
@@ -762,7 +1043,11 @@ impl<S: JetField> ForwardKernel<S> {
                 let u_offset = d.mul(&u_offset_factor);
                 for &x in &gh.nodes {
                     let raw = centre.add(&ratio.scale(x));
-                    axis_bases.extend(gh.forward_basis(&raw));
+                    let basis = gh.forward_basis(&raw);
+                    if capped {
+                        axis_corners.push(AxisCorners::new(&gh.nodes, &raw, &basis));
+                    }
+                    axis_bases.extend(basis);
                     axis_innovations.push(u_offset.add(&u_slope.scale(x)));
                     axis_coordinates.push(old.mu.add(&spread.mul(&raw)));
                 }
@@ -771,7 +1056,14 @@ impl<S: JetField> ForwardKernel<S> {
             log_gauss.push(axis_gauss);
             innovations.push(axis_innovations);
             coordinates.push(axis_coordinates);
+            if capped {
+                corners.push(axis_corners);
+            }
         }
+        let corner_values: Vec<Vec<AxisCorners<f64>>> = corners
+            .iter()
+            .map(|axis: &Vec<AxisCorners<S>>| axis.iter().map(AxisCorners::values).collect())
+            .collect();
         let log_inner_weights = (0..from.size())
             .map(|l| {
                 let mut rest = l;
@@ -792,6 +1084,12 @@ impl<S: JetField> ForwardKernel<S> {
             coordinates,
             log_inner_weights,
             factor: density.factor.clone(),
+            cap,
+            corners,
+            corner_values,
+            log_ratio_values,
+            log_ratio_bound,
+            nodal_rounding: accumulation_growth(4 * atoms + 1) * nodal_magnitude,
         }
     }
 
@@ -800,11 +1098,92 @@ impl<S: JetField> ForwardKernel<S> {
         (j / self.order.pow(k as u32)) % self.order
     }
 
+    /// The cap's level at inner point `l` of row `j` ([`LogRatioCap`]),
+    /// `Σ_c Π_k ω_{k,c_k} [ln r_c + Σ_k t_{k,c_k} (ln r_c − ln r_{c^{(k)}})] + Σ_k m_k`
+    /// over the corner combinations `c` of the axes ([`AxisCorners`]), where
+    /// `c^{(k)}` is `c` moved to its back node along axis `k`. `ln r` itself
+    /// is not concave, `ln r − Σ_k x_k²` is; the secants of `Σ_k x_k²` fall
+    /// short of it by `Σ_k m_k`, which is added back. Generic so that the
+    /// check in values and the cap in jets evaluate the same operations.
+    fn level<T: JetField>(
+        &self,
+        corners: &[Vec<AxisCorners<T>>],
+        log_ratio: &[T],
+        j: usize,
+        l: usize,
+    ) -> T {
+        let g = self.order;
+        let at = |k: usize| &corners[k][self.target_index(j, k) * g + (l / g.pow(k as u32)) % g];
+        let combinations: usize = (0..corners.len()).map(|k| at(k).count).product();
+        let mut level = log_ratio[0].constant_like(0.0);
+        for combination in 0..combinations {
+            let mut weight = log_ratio[0].constant_like(1.0);
+            let mut flat = 0;
+            let mut rest = combination;
+            let mut stride = 1;
+            for k in 0..corners.len() {
+                let axis = at(k);
+                let pick = rest % axis.count;
+                rest /= axis.count;
+                weight = weight.mul(&axis.weight[pick]);
+                flat += axis.corner[pick] * stride;
+                stride *= g;
+            }
+            let centre = &log_ratio[flat];
+            let mut bound = centre.clone();
+            rest = combination;
+            stride = 1;
+            for k in 0..corners.len() {
+                let axis = at(k);
+                let pick = rest % axis.count;
+                rest /= axis.count;
+                let back = flat + axis.back[pick] * stride - axis.corner[pick] * stride;
+                bound = bound.add(&axis.reach[pick].mul(&centre.sub(&log_ratio[back])));
+                stride *= g;
+            }
+            level = level.add(&weight.mul(&bound));
+        }
+        (0..corners.len()).fold(level, |acc, k| acc.add(&at(k).shortfall))
+    }
+
+    /// The rounding the computed excess `p − L` at inner point `l` of row `j`
+    /// can carry: the tensor interpolation's, `3G + 1` roundings per axis on
+    /// terms no larger than `M` amplified by the Lebesgue function `λ`; the
+    /// level's, `2K + 6` roundings amplified by its multiplier `C`; and the
+    /// nodal rounding `δ` through both.
+    fn excess_rounding(&self, j: usize, l: usize) -> f64 {
+        let g = self.order;
+        let axes = self.corner_values.len();
+        let mut lebesgue = 1.0;
+        let mut multiplier = 1.0;
+        for (k, axis) in self.corner_values.iter().enumerate() {
+            let corners = &axis[self.target_index(j, k) * g + (l / g.pow(k as u32)) % g];
+            lebesgue *= corners.lebesgue;
+            multiplier += corners.multiplier - 1.0;
+        }
+        accumulation_growth(axes * (3 * g + 1)) * lebesgue * self.log_ratio_bound
+            + accumulation_growth(2 * axes + 6) * multiplier * self.log_ratio_bound
+            + (lebesgue + multiplier) * self.nodal_rounding
+    }
+
     /// The log predicted density at target point `j` and its normalised
     /// inner weights.
     pub fn row(&self, j: usize) -> KernelRow<S> {
         let g = self.order;
-        let at_inner = interpolate_at_inner_points(g, &self.bases, &self.log_ratio, j);
+        let mut at_inner = interpolate_at_inner_points(g, &self.bases, &self.log_ratio, j);
+        // The cap acts on `ln r` alone, before the exact factor and the inner
+        // weights are added, so the predicted density and the weights the
+        // carried functions are averaged under come from the same limited terms.
+        let mut limited = vec![false; at_inner.len()];
+        if !self.corners.is_empty() {
+            for (l, p) in at_inner.iter_mut().enumerate() {
+                let excess = p.value() - self.level(&self.corner_values, &self.log_ratio_values, j, l);
+                if excess > 0.0 {
+                    limited[l] = excess > self.excess_rounding(j, l);
+                    *p = self.cap.apply(p, &self.level(&self.corners, &self.log_ratio, j, l));
+                }
+            }
+        }
         let inner_axes: Vec<&[S]> = self
             .coordinates
             .iter()
@@ -823,6 +1202,12 @@ impl<S: JetField> ForwardKernel<S> {
             .collect();
         let log_mass = log_sum_exp(&terms);
         let weights = terms.iter().map(|t| exp(&t.sub(&log_mass))).collect();
+        let limited = terms
+            .iter()
+            .zip(&limited)
+            .filter(|(_, flag)| **flag)
+            .map(|(t, _)| (t.value() - log_mass.value()).exp())
+            .sum();
         let log_predicted = self
             .log_gauss
             .iter()
@@ -831,12 +1216,23 @@ impl<S: JetField> ForwardKernel<S> {
         KernelRow {
             log_predicted,
             weights,
+            limited,
         }
     }
 
-    /// The log predicted density at every point of the target grid.
-    pub fn log_predicted(&self, target_size: usize) -> Vec<S> {
-        (0..target_size).map(|j| self.row(j).log_predicted).collect()
+    /// The log predicted density at every point of the target grid `to`,
+    /// refused when the cap limited more of the predicted mass than the
+    /// tolerance admits ([`LogRatioCap::admitted_share`]).
+    pub fn log_predicted(&self, to: &Grid<S>, label: &str) -> Result<Vec<S>, EventHistoryError> {
+        let mut share = LimitedShare::new();
+        let mut predicted = Vec::with_capacity(to.size());
+        for (j, weight) in to.weights.iter().enumerate() {
+            let row = self.row(j);
+            share.add(weight.value().ln() + row.log_predicted.value(), row.limited);
+            predicted.push(row.log_predicted);
+        }
+        share.check(&self.cap, label)?;
+        Ok(predicted)
     }
 
     /// Row `j` of the conditional-expectation operator: `Σ_i M_{ji} f(z_i)` is

@@ -557,6 +557,7 @@ mod tests {
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: None,
+            tolerance: crate::family::EventHistorySpec::new(Vec::new()).quadrature_tolerance,
         };
         spells(&inputs, &vec![true; count])
             .expect("spells")
@@ -864,6 +865,7 @@ mod tests {
         let inputs = SubjectInputs {
             nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0, gh: &gh,
             continuation_gap: 0.0, designs: None, log_normaliser: None,
+            tolerance: crate::family::EventHistorySpec::new(Vec::new()).quadrature_tolerance,
         };
         let statistics = Statistics::whole(&inputs, &[true]);
         let grid = statistics.place(&inputs).unwrap();
@@ -942,6 +944,7 @@ mod tests {
         let inputs = SubjectInputs {
             nodes: subject, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0, gh: &gh,
             continuation_gap: 0.0, designs: None, log_normaliser: None,
+            tolerance: crate::family::EventHistorySpec::new(Vec::new()).quadrature_tolerance,
         };
         let pass = filter(&inputs, None, &[true]).unwrap();
         let smallest: Vec<f64> = pass.log_alpha.iter().map(|log_alpha| log_alpha.iter()

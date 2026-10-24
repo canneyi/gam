@@ -36,6 +36,7 @@ impl EventHistoryFamily {
             atoms: self.atoms,
             time_scale: self.time_scale,
             gh: &self.gh,
+            tolerance: self.quadrature_tolerance,
         };
         match crate::family::reference_normalisers(tables, &shape, beta, loadings, rates) {
             Err(refusal @ EventHistoryError::ReferenceStep { .. }) => {
@@ -119,6 +120,7 @@ impl EventHistoryFamily {
                 time_scale: self.time_scale, gh: &self.gh, continuation_gap: 0.0,
                 designs: None,
                 log_normaliser: held.as_deref(),
+                tolerance: self.quadrature_tolerance,
             };
             subject_marginal(&inputs, Evaluation::Value).map(|result| result.loglik)
         }).collect();

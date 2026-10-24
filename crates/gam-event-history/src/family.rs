@@ -720,8 +720,9 @@ impl EventHistoryFamily {
         let subjects = &self.nodes.subjects;
         let gh = &self.gh;
         let time_scale = self.time_scale;
+        let tolerance = self.quadrature_tolerance;
         let evaluation = if derivatives {
-            Evaluation::Derivatives { tolerance: self.quadrature_tolerance }
+            Evaluation::Derivatives { tolerance }
         } else {
             Evaluation::Value
         };
@@ -765,6 +766,7 @@ impl EventHistoryFamily {
                     continuation_gap: 0.0,
                     designs: derivatives.then_some(views.as_slice()),
                     log_normaliser: None,
+                    tolerance,
                 };
                 let local = subject_marginal(&inputs, evaluation).map_err(|e| e.to_string())?;
                 if derivatives
@@ -945,6 +947,7 @@ impl EventHistoryFamily {
         let held = centring.as_deref();
         let gh = &self.gh;
         let time_scale = self.time_scale;
+        let tolerance = self.quadrature_tolerance;
         let all_marks = vec![true; marks];
         self.nodes
             .subjects
@@ -970,6 +973,7 @@ impl EventHistoryFamily {
                     continuation_gap: 0.0,
                     designs: None,
                     log_normaliser: normaliser.as_deref(),
+                    tolerance,
                 };
                 let pass = forward_filter(&inputs, None, &all_marks).map_err(|e| e.to_string())?;
                 let mut scores = Vec::with_capacity(n * marks);
@@ -1157,13 +1161,16 @@ pub(crate) fn reference_law(
 
 /// What evaluating a reference population's normalisers needs beside its
 /// tables and a coefficient state: the block layout the coefficients are laid
-/// out in, the latent dimensions, the time scale and the quadrature rule.
+/// out in, the latent dimensions, the time scale, the quadrature rule and the
+/// relative accuracy it is certified to, which caps every forward kernel of
+/// the evolution (`super::chain::LogRatioCap`).
 pub(crate) struct ReferenceLawShape<'a> {
     pub block_offsets: &'a [usize],
     pub marks: usize,
     pub atoms: usize,
     pub time_scale: f64,
     pub gh: &'a GaussHermite,
+    pub tolerance: f64,
 }
 
 /// The reference population's log normalisers and log risk masses at one
@@ -1206,6 +1213,7 @@ pub(crate) fn reference_normalisers<S: JetField>(
             shape.gh,
             &tables.kinds,
             shape.atoms,
+            shape.tolerance,
         )?;
         masks = out.masks;
         normalisers.extend(out.log_normaliser);

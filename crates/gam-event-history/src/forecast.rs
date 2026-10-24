@@ -380,6 +380,7 @@ pub fn latent_state(
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: normaliser.as_deref(),
+            tolerance: model.quadrature_tolerance,
         },
         model.quadrature_tolerance,
     )?;
@@ -451,6 +452,7 @@ fn observed_state(
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: normaliser.as_deref(),
+            tolerance: model.quadrature_tolerance,
         },
         None,
         &opening.compensated,
@@ -675,6 +677,7 @@ impl WindowIntegrand<'_> {
                         continuation_gap: state.map_or(0.0, |s| times[0] - s.time),
                         designs: None,
                         log_normaliser: normaliser.as_deref(),
+                        tolerance: model.quadrature_tolerance,
                     },
                     state.map(|s| (&s.grid, s.log_alpha.as_slice(), &s.density)),
                     &run.exposed,
@@ -1289,6 +1292,7 @@ pub fn predictive_pit(
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: normaliser.as_deref(),
+            tolerance: model.quadrature_tolerance,
         },
         &vec![true; marks],
     )?;

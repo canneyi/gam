@@ -52,8 +52,9 @@
 //! [`super::family`]).
 
 use super::chain::{
-    AtomTransition, FactorMark, ForwardKernel, GaussHermite, Grid, LogFactor, SplitDensity,
-    backward_axis_bases, interpolate_at_inner_points, log_standard_prior, log_sum_exp,
+    AtomTransition, FactorMark, ForwardKernel, GaussHermite, Grid, LimitedShare, LogFactor,
+    LogRatioCap, SplitDensity, backward_axis_bases, interpolate_at_inner_points,
+    log_standard_prior, log_sum_exp,
 };
 use super::cohort::{EventHistoryError, SubjectNodes};
 use super::scalar::{add_real, div, exp, ln, recip, sqrt, square};
@@ -89,6 +90,13 @@ pub(crate) struct SubjectInputs<'a, S> {
     /// `n * marks + d`. `None` centres on the stationary prior instead, the
     /// constant `½|a_d|²` (see `super::preserve`).
     pub log_normaliser: Option<&'a [S]>,
+    /// The relative accuracy the fit's quadrature is certified to
+    /// (`super::family::EventHistorySpec::quadrature_tolerance`). Every
+    /// forward kernel's cap reads it ([`LogRatioCap`]): the most the cap lets
+    /// an interpolated `ln r` exceed its concavity bound is `ln(1 + tolerance)`,
+    /// and a kernel that limited more than `tolerance / (1 + tolerance)` of a
+    /// predicted mass is refused.
+    pub tolerance: f64,
 }
 
 /// Marginal log-likelihood and its derivatives in the subject-local parameter
@@ -713,6 +721,7 @@ pub(crate) fn predict<S: JetField>(
     previous_log_alpha: &[S],
     previous_density: &SplitDensity<S>,
     transitions: &[AtomTransition<S>],
+    cap: LogRatioCap,
     label: &str,
 ) -> Result<(Grid<S>, Vec<S>), EventHistoryError> {
     let atoms = transitions.len();
@@ -735,8 +744,8 @@ pub(crate) fn predict<S: JetField>(
         .collect();
     let predictive = Grid::new(gh, &centres, &scales, like);
     let log_predicted =
-        ForwardKernel::new(gh, previous_grid, previous_density, &predictive, transitions)
-            .log_predicted(predictive.size());
+        ForwardKernel::new(gh, previous_grid, previous_density, &predictive, transitions, cap)
+            .log_predicted(&predictive, label)?;
     Ok((predictive, log_predicted))
 }
 
@@ -752,6 +761,7 @@ pub(crate) fn filter_step<S: JetField>(
     transitions: Vec<AtomTransition<S>>,
     node_terms: &dyn Fn(&Grid<S>, bool) -> NodeLikelihood<S>,
     derivatives: bool,
+    cap: LogRatioCap,
     label: &str,
 ) -> Result<FilteredNode<S>, EventHistoryError> {
     if !transitions.is_empty() && transitions.iter().all(|t| t.innovation.value() == 0.0) {
@@ -766,8 +776,9 @@ pub(crate) fn filter_step<S: JetField>(
             log_predicted: previous_log_alpha.to_vec(), log_alpha: state.log_alpha,
             alpha: state.alpha, log_normaliser: state.log_normaliser, likelihood, density });
     }
-    let (predictive, rough_predicted) =
-        predict(gh, like, previous_grid, previous_log_alpha, previous_density, &transitions, label)?;
+    let (predictive, rough_predicted) = predict(
+        gh, like, previous_grid, previous_log_alpha, previous_density, &transitions, cap, label,
+    )?;
     let rough = node_terms(&predictive, false);
     let rough_state = condition(
         &predictive,
@@ -783,8 +794,9 @@ pub(crate) fn filter_step<S: JetField>(
         .map(|axis| axis.sigma.clone())
         .collect();
     let grid = Grid::new(gh, &means, &scales, like);
-    let log_predicted = ForwardKernel::new(gh, previous_grid, previous_density, &grid, &transitions)
-        .log_predicted(grid.size());
+    let log_predicted =
+        ForwardKernel::new(gh, previous_grid, previous_density, &grid, &transitions, cap)
+            .log_predicted(&grid, label)?;
     let likelihood = node_terms(&grid, derivatives);
     let state = condition(&grid, &log_predicted, &likelihood.ell, likelihood.shift, label)?;
     let density =
@@ -956,6 +968,7 @@ pub(crate) fn subject_marginal<S: JetField>(
     // expectation zero by the compensator identity, and the estimating
     // equation the held normaliser defines is unbiased.
     let prior_centred = inputs.log_normaliser.is_none();
+    let cap = LogRatioCap::new(inputs.tolerance)?;
     let mut mean = vec![zero.clone(); p_total];
     let mut second = vec![zero.clone(); p_total * p_total];
     let mut curvature = vec![zero.clone(); p_total * p_total];
@@ -1387,18 +1400,22 @@ pub(crate) fn subject_marginal<S: JetField>(
         // inner rule collapses onto `z = z'/φ` at `q = 0`, carries the
         // functions to it.
         let zero_gap = transitions.iter().all(|t| t.innovation.value() == 0.0);
+        // The rows carry the functions under the same limited weights the
+        // filter predicted with, and their limited share is refused as there.
         let propagate = |source_grid: &Grid<S>,
                          source_density: &SplitDensity<S>,
                          source_values: &[S],
                          target: &Grid<S>|
-         -> Vec<S> {
+         -> Result<Vec<S>, EventHistoryError> {
             let source_size = source_grid.size();
             let kernel =
-                ForwardKernel::new(inputs.gh, source_grid, source_density, target, transitions);
+                ForwardKernel::new(inputs.gh, source_grid, source_density, target, transitions, cap);
             let target_size = target.size();
             let mut propagated = vec![zero.clone(); p_total * target_size];
+            let mut share = LimitedShare::new();
             for j in 0..target_size {
                 let row = kernel.row(j);
+                share.add(target.weights[j].value().ln() + row.log_predicted.value(), row.limited);
                 let transfer = kernel.transfer(j, &row.weights);
                 for q in 0..p_total {
                     let carried_q = &source_values[q * source_size..(q + 1) * source_size];
@@ -1427,7 +1444,8 @@ pub(crate) fn subject_marginal<S: JetField>(
                     propagated[slot] = propagated[slot].add(&expected);
                 }
             }
-            propagated
+            share.check(&cap, &format!("node {}: carried score", m + 1))?;
+            Ok(propagated)
         };
         let filtered_source = &filtered[m];
         // Node m's smoothed grid with the FILTERED density read on it: the
@@ -1458,14 +1476,14 @@ pub(crate) fn subject_marginal<S: JetField>(
                 ),
             }
         });
-        carried_smoothed = next_smoothed;
+        carried_smoothed = next_smoothed.transpose()?;
         if !zero_gap {
             carried = propagate(
                 &filtered_source.grid,
                 &filtered_source.density,
                 &carried,
                 &next.grid,
-            );
+            )?;
         }
     }
 
@@ -1591,6 +1609,7 @@ fn filter_nodes<S: JetField>(
             })
             .collect());
     }
+    let cap = LogRatioCap::new(inputs.tolerance)?;
     let mut filtered: Vec<FilteredNode<S>> = Vec::with_capacity(n_nodes);
     let node_terms = |grid: &Grid<S>, n: usize, store: bool| -> NodeLikelihood<S> {
         subject_node_likelihood(inputs, counts_rows, exposure_rows, grid, n, store)
@@ -1614,6 +1633,7 @@ fn filter_nodes<S: JetField>(
             transitions,
             &|grid, store| node_terms(grid, n + 1, store),
             derivatives,
+            cap,
             &format!("node {}", n + 1),
         )?;
         filtered.push(step);
@@ -1782,6 +1802,7 @@ fn backward_smoother<S: JetField>(
     let like = &inputs.eta0[0];
     let zero = like.constant_like(0.0);
     let n_gaps = n_nodes.saturating_sub(1);
+    let cap = LogRatioCap::new(inputs.tolerance)?;
     // How many interpolating forward kernels each node's FILTERED density
     // came through, so the smoother can say what noise it carries
     // ([`interpolation_noise_relative`]). The first node's density is the
@@ -1885,8 +1906,8 @@ fn backward_smoother<S: JetField>(
             let previous = &filtered[n - 1];
             (
                 ForwardKernel::new(gh, &previous.grid, &previous.density, &grid,
-                    &filtered[n].transitions)
-                    .log_predicted(size),
+                    &filtered[n].transitions, cap)
+                    .log_predicted(&grid, &label)?,
                 filter_operators[n - 1] + 1,
             )
         };
@@ -2092,6 +2113,7 @@ pub(crate) fn forward_filter<S: JetField>(
         return crate::static_state::filter(inputs, initial, compensated);
     }
     let like = &inputs.eta0[0];
+    let cap = LogRatioCap::new(inputs.tolerance)?;
     let mut grids: Vec<Arc<Grid<S>>> = Vec::with_capacity(n_nodes);
     let mut log_alpha: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
     let mut log_predicted: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
@@ -2132,6 +2154,7 @@ pub(crate) fn forward_filter<S: JetField>(
             transitions_across(inputs.rates, inputs.continuation_gap, inputs.time_scale)?,
             &|grid, _| node_terms(grid, 0),
             false,
+            cap,
             "forecast first node",
         )?,
     };
@@ -2150,6 +2173,7 @@ pub(crate) fn forward_filter<S: JetField>(
             transitions_across(inputs.rates, nodes.gaps[n], inputs.time_scale)?,
             &|grid, _| node_terms(grid, n + 1),
             false,
+            cap,
             &format!("forecast node {}", n + 1),
         )?;
         log_normalisers.push(step.log_normaliser.add(&like.constant_like(step.likelihood.shift)));
@@ -2529,10 +2553,12 @@ mod tests {
                 let louis_inputs = SubjectInputs {
                     nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0,
                     gh: &gh, continuation_gap: 0.0, designs: Some(&views[..]), log_normaliser: None,
+                    tolerance: default_quadrature_tolerance(),
                 };
                 let block_inputs = SubjectInputs {
                     nodes: &nodes, eta0: &block_eta0, loadings: &block_loadings, rates: &block_rates,
                     time_scale: 1.0, gh: &gh, continuation_gap: 0.0, designs: None, log_normaliser: None,
+                    tolerance: default_quadrature_tolerance(),
                 };
                 let louis = filter_nodes(&louis_inputs, true, &counts_rows, &exposure_rows).unwrap();
                 let block = filter_nodes(&block_inputs, false, &counts_rows, &exposure_rows).unwrap();
@@ -2677,6 +2703,7 @@ mod tests {
             let inputs = SubjectInputs {
                 nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0,
                 gh: &gh, continuation_gap: 0.0, designs: None, log_normaliser: None,
+                tolerance: default_quadrature_tolerance(),
             };
             let moments = latent_state_moments(&inputs, default_quadrature_tolerance()).unwrap();
             measured.push((
