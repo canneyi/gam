@@ -1098,7 +1098,8 @@ impl<S: JetField> ForwardKernel<S> {
         (j / self.order.pow(k as u32)) % self.order
     }
 
-    /// The cap's level at inner point `l` of row `j` ([`LogRatioCap`]),
+    /// The cap's level at the inner point whose corners along axis `k` are
+    /// `corners[k][cells[k]]` ([`LogRatioCap`]),
     /// `Σ_c Π_k ω_{k,c_k} [ln r_c + Σ_k t_{k,c_k} (ln r_c − ln r_{c^{(k)}})] + Σ_k m_k`
     /// over the corner combinations `c` of the axes ([`AxisCorners`]), where
     /// `c^{(k)}` is `c` moved to its back node along axis `k`. `ln r` itself
@@ -1108,56 +1109,56 @@ impl<S: JetField> ForwardKernel<S> {
     fn level<T: JetField>(
         &self,
         corners: &[Vec<AxisCorners<T>>],
+        cells: &[usize],
         log_ratio: &[T],
-        j: usize,
-        l: usize,
     ) -> T {
         let g = self.order;
-        let at = |k: usize| &corners[k][self.target_index(j, k) * g + (l / g.pow(k as u32)) % g];
-        let combinations: usize = (0..corners.len()).map(|k| at(k).count).product();
+        let at = |k: usize| &corners[k][cells[k]];
         let mut level = log_ratio[0].constant_like(0.0);
-        for combination in 0..combinations {
+        // Bit `k` of `combination` picks axis `k`'s corner, and an axis with
+        // one corner admits only bit zero: every inner point takes this check,
+        // so the picks are read off bits rather than divided out.
+        for combination in 0..1_usize << cells.len() {
+            if (0..cells.len()).any(|k| (combination >> k) & 1 >= at(k).count) {
+                continue;
+            }
             let mut weight = log_ratio[0].constant_like(1.0);
             let mut flat = 0;
-            let mut rest = combination;
             let mut stride = 1;
-            for k in 0..corners.len() {
+            for k in 0..cells.len() {
                 let axis = at(k);
-                let pick = rest % axis.count;
-                rest /= axis.count;
+                let pick = (combination >> k) & 1;
                 weight = weight.mul(&axis.weight[pick]);
                 flat += axis.corner[pick] * stride;
                 stride *= g;
             }
             let centre = &log_ratio[flat];
             let mut bound = centre.clone();
-            rest = combination;
             stride = 1;
-            for k in 0..corners.len() {
+            for k in 0..cells.len() {
                 let axis = at(k);
-                let pick = rest % axis.count;
-                rest /= axis.count;
+                let pick = (combination >> k) & 1;
                 let back = flat + axis.back[pick] * stride - axis.corner[pick] * stride;
                 bound = bound.add(&axis.reach[pick].mul(&centre.sub(&log_ratio[back])));
                 stride *= g;
             }
             level = level.add(&weight.mul(&bound));
         }
-        (0..corners.len()).fold(level, |acc, k| acc.add(&at(k).shortfall))
+        (0..cells.len()).fold(level, |acc, k| acc.add(&at(k).shortfall))
     }
 
-    /// The rounding the computed excess `p − L` at inner point `l` of row `j`
+    /// The rounding the computed excess `p − L` at the inner point of `cells`
     /// can carry: the tensor interpolation's, `3G + 1` roundings per axis on
     /// terms no larger than `M` amplified by the Lebesgue function `λ`; the
     /// level's, `2K + 6` roundings amplified by its multiplier `C`; and the
     /// nodal rounding `δ` through both.
-    fn excess_rounding(&self, j: usize, l: usize) -> f64 {
+    fn excess_rounding(&self, cells: &[usize]) -> f64 {
         let g = self.order;
-        let axes = self.corner_values.len();
+        let axes = cells.len();
         let mut lebesgue = 1.0;
         let mut multiplier = 1.0;
-        for (k, axis) in self.corner_values.iter().enumerate() {
-            let corners = &axis[self.target_index(j, k) * g + (l / g.pow(k as u32)) % g];
+        for (axis, &cell) in self.corner_values.iter().zip(cells) {
+            let corners = &axis[cell];
             lebesgue *= corners.lebesgue;
             multiplier += corners.multiplier - 1.0;
         }
@@ -1176,11 +1177,21 @@ impl<S: JetField> ForwardKernel<S> {
         // carried functions are averaged under come from the same limited terms.
         let mut limited = vec![false; at_inner.len()];
         if !self.corners.is_empty() {
+            // Row `j` fixes each axis's block of `G` corners and the inner
+            // point picks within it.
+            let blocks: Vec<usize> =
+                (0..self.corners.len()).map(|k| self.target_index(j, k) * g).collect();
+            let mut cells = vec![0; blocks.len()];
             for (l, p) in at_inner.iter_mut().enumerate() {
-                let excess = p.value() - self.level(&self.corner_values, &self.log_ratio_values, j, l);
+                let mut rest = l;
+                for (cell, block) in cells.iter_mut().zip(&blocks) {
+                    *cell = block + rest % g;
+                    rest /= g;
+                }
+                let excess = p.value() - self.level(&self.corner_values, &cells, &self.log_ratio_values);
                 if excess > 0.0 {
-                    limited[l] = excess > self.excess_rounding(j, l);
-                    *p = self.cap.apply(p, &self.level(&self.corners, &self.log_ratio, j, l));
+                    limited[l] = excess > self.excess_rounding(&cells);
+                    *p = self.cap.apply(p, &self.level(&self.corners, &cells, &self.log_ratio));
                 }
             }
         }
