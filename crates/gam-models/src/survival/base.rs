@@ -2313,6 +2313,13 @@ impl WorkingModelSurvival {
         self.age_exit.len()
     }
 
+    /// Whether any row enters after the time origin (left truncation). Such a
+    /// row adds `−exp(η_entry)·a₀a₀ᵀ` to the Hessian, so the inner penalized
+    /// objective is not convex and can have more than one mode at one ρ (#4589).
+    pub(crate) fn has_delayed_entry(&self) -> bool {
+        self.entry_at_origin.iter().any(|&at_origin| !at_origin)
+    }
+
     /// The λ-selection domain of the active penalty blocks (#2812): per block,
     /// the resolvability interval of the block's penalty against the exit
     /// design's Gram on the block's columns. Below the lower edge the block is
